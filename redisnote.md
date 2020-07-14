@@ -28,7 +28,7 @@ redis有5种基础数据结构
 
   
 
-![img](.\redis学习笔记.assets\v2-5c19b99b7985cf0087f8293e287723ca_720w.jpg)
+![img](.\redisnote.assets\v2-5c19b99b7985cf0087f8293e287723ca_720w.jpg)
 
 
 
@@ -232,7 +232,7 @@ redis底层存储的是快速链表quicklist
 - 当数据量比较多的时候会改成quicklist，因为普通的链表需要的附加指针空间太大，浪费空间且加速内存的碎片化
 - redis 将链表和ziplist结合起来组成quicklist，即将多个ziplist使用双向指针串起来使用。
 
-![未命名绘图](.\redis学习笔记.assets\未命名绘图-1588674709346.png)
+![未命名绘图](.\redisnote.assets\未命名绘图-1588674709346.png)
 
 
 
@@ -879,7 +879,7 @@ redis对HyperLogLog数据存储做了优化，在计数较小时，采用稀疏�
 
 ### 5.3 HyperLogLog实现原理
 
-![image-20200710142516454](.\redis学习笔记.assets\image-20200710142516454.png)
+![image-20200710142516454](.\redisnote.assets\image-20200710142516454.png)
 
 如图，给定一系列随机数，用maxbit记录地位连续零位的最大长度k。可以通过K值估算出随机数的数量N。
 
@@ -1173,7 +1173,7 @@ $F=(1-0.5^t)^k$ 其中 k hash函数最佳数量 t 实际数量与预计数量的
 
 ### 6.3 布隆过滤器的原理
 
-![image-20200710220434932](.\redis学习笔记.assets\image-20200710220434932.png)
+![image-20200710220434932](.\redisnote.assets\image-20200710220434932.png)
 
 如图，布隆过滤器对应得redis数据结构是一个大型的位数组和几个不同的无偏哈希函数。图中，f，g，h代表哈希函数，无偏指的是元素的哈希算得较为均匀。
 
@@ -1198,6 +1198,712 @@ $f=0.6185^{L/n}$
 
 - 位数组的长度L，即需要的存储空间bit
 - hash函数的最佳数量K
+
+## 7 简单限流
+
+限流的目的是控制流量和控制用户行为
+
+### 7.1 简单限流策略解决方案
+
+比如限定某个用户某个行为在一定时间内只发生N次。
+
+需要一个固定宽度的时间滑动茶窗口。
+
+用zset结构记录用户的行为历史，每一个行为作为zset中的key保存下来，value
+
+为保证唯一性可用uuid或者时间戳生成。score用时间戳，圈定时间窗口
+
+```python
+
+import  redis
+import time
+
+client = redis.StrictRedis()
+
+def is_action_allowed(user_id, action_key, period, max_count):
+    key = 'hist:%s:%s' % (user_id, action_key)
+    now_ts = int(time.time() * 1000) # 毫秒时间戳
+    with client.pipeline() as pipe:
+        # 记录行为
+        # value和score 使用毫秒时间戳
+        pipe.zadd(key, {now_ts: now_ts})
+        # 移除时间窗口外的行为数据，剩下的都是时间窗口内的
+        pipe.zremrangebyscore(key, 0, now_ts - period * 1000)
+        # 获取窗口内的行为数量
+        pipe.zcard(key)
+        # 设置行为过期期限，比period多一妙
+        pipe.expire(key, period + 10)
+        # 批量执行pipe内的命令。
+        _, _, current_count, _ = pipe.execute()
+    #比较数量是否超标。
+    return current_count, max_count, current_count<=max_count
+    
+
+for i in range(20):
+    print(i,is_action_allowed("user1","reply",60,5))
+```
+
+注意：这段代码中 判断前已经实际插入了。需要修改
+
+简单限流不适用于一定时间内次数较大的情况，因为它记录了时间窗口内所有的行为。会消耗大量的存储空间
+
+
+
+## 8 漏斗限流
+
+漏斗的剩余空间代表当前行为可以持续的数量，漏嘴的流水速率，代表系统允许该行为的最大频率。
+
+```python
+# 模拟 单机漏斗算法
+import time
+import random
+
+class Funnel(object):
+    def __init__(self,capacity,leaking_rate):
+        self.capacity = capacity              # 漏斗容量
+        self.leaking_rate = leaking_rate  # 漏嘴流水速率
+        self.left_quota = capacity        # 漏斗剩余空间
+        self.leaking_ts = time.time()  # 上一次漏水时间
+        
+    def make_spcke(self):
+        now_ts = time.time()
+        # 距离上一次漏水过去的时间
+        delta_ts = now_ts - self.leaking_ts
+        #可以腾出的空间
+        delta_quota = delta_ts * self.leaking_rate
+        # 若腾出的空间太少，就放弃
+        if delta_quota < 1:
+            return
+        self.left_quota += delta_quota  # 增加剩余空间
+        self.leaking_ts = now_ts  # 记录漏水时间
+        if self.left_quota > self.capacity:
+            self.left_quota = self.capacity
+        
+    def watering(self, quota):
+        self.make_spcke()
+        if self.left_quota >= quota:
+            self.left_quota -= quota
+            return True
+        return False
+
+
+funnels = {}
+# 所有的漏斗
+
+
+def is_action_allowed(user_id, action_key, capacity, leaking_rate):
+    """
+    capacity 漏斗容量 \n
+    leaking_rate 漏嘴流水速率 quota/s
+    """
+    key = '%s:%s' % (user_id, action_key)
+    funnel = funnels.get(key)
+    if not funnel:
+        funnel = Funnel(capacity, leaking_rate)
+        funnels[key] = funnel
+    return funnel.watering(1)
+
+
+for i in range(30):
+    x=random.random()
+    time.sleep(x)
+    print(i,is_action_allowed("digua","reply",15,0.5))
+```
+
+输出：
+
+```
+0 True
+1 True
+2 True
+3 True
+4 True
+5 True
+6 True
+7 True
+8 True
+9 True
+10 True
+11 True
+12 True
+13 True
+14 True
+15 True
+16 True
+17 True
+18 True
+19 False
+20 False
+21 False
+22 True
+23 False
+24 False
+25 True
+26 True
+27 False
+28 False
+29 False
+```
+
+以上是单机版的实现。
+
+### 8.1redis-cell 
+
+redis4.0提供了一个限流模块redis-cell，该模块使用漏斗算法，并提供原子的限流指令。
+
+```markdown
+CL.THROTTLE     user123    15     30    60     1
+                                       ▲            ▲    ▲      ▲   ▲
+                                        |                |        |        |   └───── apply 1 token (default if omitted)
+                                        |                |      └─┴─────── 30 tokens / 60 seconds
+                                        |              └───────────── 15 max_burst
+               						  └─────────────────── key "user123"
+```
+
+
+
+```
+127.0.0.1:6379> cl.throttle user1:reply 15 30 60 1 
+1) (integer) 0      # 0表示允许 1表示拒绝
+2) (integer) 16    # 漏斗容量 值为(max_brust+1)
+3) (integer) 15    # 漏斗剩余容量
+4) (integer) -1     # 如果被拒绝了 需要多长时间再试
+5) (integer) 2      # 多场时间后，漏斗完全空出来
+
+```
+
+- user1:reply 是key值
+
+- 15 max_brust值
+
+- 30  operations/60 seconds 漏水速率， 表示每60秒允许执行30个操作
+
+- need 1 token（可选参数，默认值是1）表示本次占用的令牌数
+
+  
+
+## 9 GeoHash
+
+redis3.2 增加了地理位置Geo模块，应用：附近的xxxx 
+
+### 9.1 用数据库算附近的人
+
+假设元素的经纬坐标使用关系数据库(元素id,经度x，纬度y)
+
+一般方法是通过矩形区域，来限定元素的数量，然后对区域内的元素进行全量计算再排序。不直接遍历所有元素是为了减少计算量
+
+sql语句划定矩形区域
+
+`select id form positions where x0-r<x<x0+r and y0-r<y<t0+r`
+
+数据库把经纬坐标加双向复合索引(x,y),，可以最大化查询性能
+
+但在高并发场合 ，不是好的解决方案。
+
+### 9.2 GeoHash算法
+
+redis支持使用地理位置距离算法GeoHash算法。
+
+该算法将二维的经纬数据集映射到一维的整数，这样，所有的元素将挂载到一条直线上。距离相近的二维坐标映射到一维后的点之间距离也会接近。
+
+具体映射算法：
+
+将地球看作一个二维平面，划分成一系列正方形的方格。
+
+所有的地图元素坐标都将放置在唯一的方格中。
+
+方格越小，坐标越精确。
+
+对这些方格进行整数编码，越是靠近的方格编码越是接近。
+
+编码方案：二刀法（真实算法还有很多其他方案）
+
+二刀法将中正方形切割为4个小正方形，分别标记为00，01，10，11二进制整数。
+
+然后对每个小正方形在切割，每个小小正方形就可以用4bit的二进制数表示。
+
+继续切下去，正方形越来越小，精度也就越来越高。
+
+
+
+编码之后，地图元素的坐标变成一个整数，且通过这个整数可以还原元素的坐标。
+
+GeoHash会对这个整数做base32编码，变成字符串。
+
+在redis里，经纬度用52位的整数进行编码，放进zset里。
+
+zset的value是元素的key，score是Geohash的52位整数（可以无损存储）
+
+**注意** 使用的时候，要记住，只是一个普通的zset结构。
+
+### 9.3 Geo指令的基本使用
+
+**再次注意** 使用的时候，要记住，只是一个普通的zset结构。
+
+##### 增加   geoadd
+
+```bash
+127.0.0.1:6379> geoadd company 116.49105 39.996764 juejin
+(integer) 1
+127.0.0.1:6379> geoadd company 116.51403 39.905409 ireader
+(integer) 1
+127.0.0.1:6379> geoadd company 116.489033 40.007669 meituan
+(integer) 1
+127.0.0.1:6379> geoadd company 116.562108 39.787602 jd 116.334255 40.027400 xiaomi
+(integer) 2
+
+```
+
+删除指令 可以使用zset的zrem指令 
+
+```
+127.0.0.1:6379> zrem company ireader  
+(integer) 1
+```
+
+##### 距离  geodist
+
+```bash
+127.0.0.1:6379> geodist company juejin ireader km
+"10.3510"
+127.0.0.1:6379> geodist company juejin meituan km
+"1.2252"
+127.0.0.1:6379> geodist company juejin jd  km
+"24.0414"
+127.0.0.1:6379> geodist company juejin xiaomi km
+"13.7852"
+127.0.0.1:6379> geodist company juejin juejin km
+"0.0000"
+
+```
+
+距离单位可以是 m、km、ml（英里）、ft（尺）
+
+##### 获取元素位置    geopos
+
+```bash
+127.0.0.1:6379> geopos company juejin
+1) 1) "116.49104923009872437"
+   2) "39.99676307192869018"
+127.0.0.1:6379> geopos company ireader
+1) 1) "116.5142020583152771"
+   2) "39.90540918662494363"
+127.0.0.1:6379> geopos company juejin ireader 
+1) 1) "116.49104923009872437"
+   2) "39.99676307192869018"
+2) 1) "116.5142020583152771"
+   2) "39.90540918662494363"
+
+```
+
+可以与输入的数据对比发现，有较小的误差。
+
+##### 获取元素的hash值    geohash
+
+```bash
+127.0.0.1:6379> geohash company juejin
+1) "wx4gdc4nn10"
+127.0.0.1:6379> geohash company ireader
+1) "wx4g52e1ce0"
+127.0.0.1:6379> geohash company jd
+1) "wx4fk7jgtf0"
+
+```
+
+得到的结果是base32编码 
+
+#####  附近的xxx     georadius   georadiusbymember
+
+`GEORADIUS key longitude latitude radius m|km|ft|mi [WITHCOORD] [WITHDIST] [WITHHASH] [ASC|DESC] [COUNT count]`
+
+以给定的经纬度为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素。
+
+范围可以使用以下其中一个单位：
+
+- `m` 表示单位为米。
+- `km` 表示单位为千米。
+- `mi` 表示单位为英里。
+- `ft` 表示单位为英尺。
+
+在给定以下可选项时， 命令会返回额外的信息：
+
+- `WITHDIST` ： 在返回位置元素的同时， 将位置元素与中心之间的距离也一并返回。 距离的单位和用户给定的范围单位保持一致。
+- `WITHCOORD` ： 将位置元素的经度和维度也一并返回。
+- `WITHHASH` ： 以 52 位有符号整数的形式， 返回位置元素经过原始 geohash 编码的有序集合分值。 这个选项主要用于底层应用或者调试， 实际中的作用并不大。
+
+命令默认返回未排序的位置元素。 通过以下两个参数， 用户可以指定被返回位置元素的排序方式：
+
+- `ASC` ： 根据中心的位置， 按照从近到远的方式返回位置元素。
+- `DESC` ： 根据中心的位置， 按照从远到近的方式返回位置元素。
+
+在默认情况下， `GEORADIUS` 命令会返回所有匹配的位置元素。 虽然用户可以使用 `COUNT <count>` 选项去获取前 N 个匹配元素， 但是因为命令在内部可能会需要对所有被匹配的元素进行处理， 所以在对一个非常大的区域进行搜索时， 即使只使用 `COUNT` 选项去获取少量元素， 命令的执行速度也可能会非常慢。 但是从另一方面来说， 使用 `COUNT` 选项去减少需要返回的元素数量， 对于减少带宽来说仍然是非常有用的。
+
+```bash
+127.0.0.1:6379> GEORADIUS company 116 39 200 km withdist
+1) 1) "jd"
+   2) "100.0425"
+2) 1) "xiaomi"
+   2) "117.8181"
+3) 1) "ireader"
+   2) "109.9621"
+4) 1) "juejin"
+   2) "118.6061"
+5) 1) "meituan"
+   2) "119.6789"
+127.0.0.1:6379> GEORADIUS company 116 39 200 km withdist count 3
+1) 1) "jd"
+   2) "100.0425"
+2) 1) "ireader"
+   2) "109.9621"
+3) 1) "xiaomi"
+   2) "117.8181"
+127.0.0.1:6379> GEORADIUS company 116 39 200 km withdist asc  count 3
+1) 1) "jd"
+   2) "100.0425"
+2) 1) "ireader"
+   2) "109.9621"
+3) 1) "xiaomi"
+   2) "117.8181"
+127.0.0.1:6379> GEORADIUS company 116 39 200 km withdist desc  count 3
+1) 1) "meituan"
+   2) "119.6789"
+2) 1) "juejin"
+   2) "118.6061"
+3) 1) "xiaomi"
+   2) "117.8181"
+
+```
+
+还有另外一个命令georadiusbymember ，georadiusbymember 用于查询指定元素附近的其他元素。
+
+这个命令的中心点由给定的位置元素给出。
+
+```bash
+127.0.0.1:6379> GEORADIUSBYMEMBER company juejin 20 km withdist desc  count 3
+1) 1) "xiaomi"
+   2) "13.7852"
+2) 1) "ireader"
+   2) "10.3510"
+3) 1) "meituan"
+   2) "1.2252"
+127.0.0.1:6379> GEORADIUSBYMEMBER company juejin 20 km withdist asc  count 3
+1) 1) "juejin"
+   2) "0.0000"
+2) 1) "meituan"
+   2) "1.2252"
+3) 1) "ireader"
+   2) "10.3510"
+127.0.0.1:6379> GEORADIUSBYMEMBER company juejin 20 km withdist asc 
+1) 1) "juejin"
+   2) "0.0000"
+2) 1) "meituan"
+   2) "1.2252"
+3) 1) "ireader"
+   2) "10.3510"
+4) 1) "xiaomi"
+   2) "13.7852"
+127.0.0.1:6379> GEORADIUSBYMEMBER company juejin 20 km withcoord asc 
+1) 1) "juejin"
+   2) 1) "116.49104923009872437"
+      2) "39.99676307192869018"
+2) 1) "meituan"
+   2) 1) "116.48903220891952515"
+      2) "40.00766997707732031"
+3) 1) "ireader"
+   2) 1) "116.5142020583152771"
+      2) "39.90540918662494363"
+4) 1) "xiaomi"
+   2) 1) "116.33425265550613403"
+      2) "40.02740024658161389"
+127.0.0.1:6379> GEORADIUSBYMEMBER company juejin 20 km withhash asc 
+1) 1) "juejin"
+   2) (integer) 4069887162735447
+2) 1) "meituan"
+   2) (integer) 4069887179083478
+3) 1) "ireader"
+   2) (integer) 4069886008361398
+4) 1) "xiaomi"
+   2) (integer) 4069880904286516
+
+```
+
+## 10 scan
+
+redis提供keys指令用来列出满足所有特定正则字符串规则的key
+
+但是有两个去缺点：
+
+- 没有offset limit 参数
+- keys是遍历算法 复杂度为o(n) 海量数据下 ，会造成卡顿
+
+redis2.8加入了新的命令，scan
+
+- 复杂度o(n)，但它是通过游标分步进行的，不会阻塞线程
+- 提供limit参数，控制返回结果的最大条数
+- 提供模式匹配 正则
+- 服务器不为游标保存状态，唯一状态是scan返回的游标整数
+- 返回结果有重复 需要客户端去重
+- 遍历的过程，若有数据修改，则改动后的数据不一定被遍历到
+- 单词返回i的结果为空，不是遍历结束，要看返回i的游标值是否为空。
+
+### 10.1基本用法
+
+比如在redis插入了1w条数据
+
+然后通过scan命令查找以key99开头的key
+
+scan命令有3个参数，第一个是cursor的整数值，第二个是key的正则模式 match，第三个是遍历的limit hint。
+
+返回的结果，第一个整数是下一次遍历的cursor，直到返回为0，才遍历结束。
+
+limit限制的是服务器单次遍历的字典槽位数量（约等于）
+
+```bash
+127.0.0.1:6379> scan 0 match key99* count 1000
+1) "15256"
+2)  1) "key9973"
+    2) "key9995"
+    3) "key996"
+    4) "key9975"
+    5) "key9971"
+    6) "key9983"
+    7) "key9939"
+    8) "key9920"
+    9) "key9940"
+   10) "key994"
+   11) "key9938"
+127.0.0.1:6379> 
+127.0.0.1:6379> scan 0 match key99* count 1000
+1) "15256"
+2)  1) "key9973"
+    2) "key9995"
+    3) "key996"
+    4) "key9975"
+    5) "key9971"
+    6) "key9983"
+    7) "key9939"
+    8) "key9920"
+    9) "key9940"
+   10) "key994"
+   11) "key9938"
+127.0.0.1:6379> scan 0 match key99* count 1000
+1) "15256"
+2)  1) "key9973"
+    2) "key9995"
+    3) "key996"
+    4) "key9975"
+    5) "key9971"
+    6) "key9983"
+    7) "key9939"
+    8) "key9920"
+    9) "key9940"
+   10) "key994"
+   11) "key9938"
+127.0.0.1:6379> scan 0 match key99* count 1000
+1) "15256"
+2)  1) "key9973"
+    2) "key9995"
+    3) "key996"
+    4) "key9975"
+    5) "key9971"
+    6) "key9983"
+    7) "key9939"
+    8) "key9920"
+    9) "key9940"
+   10) "key994"
+   11) "key9938"
+127.0.0.1:6379> scan 15256 match key99* count 1000
+1) "9260"
+2)  1) "key9919"
+    2) "key9901"
+    3) "key9922"
+    4) "key9904"
+    5) "key9951"
+    6) "key9963"
+    7) "key9965"
+    8) "key9930"
+    9) "key9998"
+   10) "key9914"
+   11) "key9986"
+   12) "key9911"
+   13) "key9961"
+127.0.0.1:6379> scan 9260 match key99* count 1000
+1) "15730"
+2) 1) "key9929"
+   2) "key9967"
+   3) "key9968"
+   4) "key9999"
+   5) "key9954"
+   6) "key9957"
+   7) "key9900"
+   8) "key9935"
+   9) "key9921"
+127.0.0.1:6379> scan 15730 match key99* count 1000
+1) "10982"
+2)  1) "key9979"
+    2) "key9991"
+    3) "key9903"
+    4) "key9978"
+    5) "key9944"
+    6) "key9988"
+    7) "key9916"
+    8) "key9956"
+    9) "key9915"
+   10) "key9982"
+   11) "key9931"
+   12) "key9950"
+127.0.0.1:6379> scan 10982 match key99* count 1000
+1) "14846"
+2) 1) "key9906"
+   2) "key9984"
+   3) "key995"
+   4) "key9905"
+   5) "key9910"
+   6) "key9980"
+127.0.0.1:6379> scan 14846 match key99* count 1000
+1) "5401"
+2)  1) "key9936"
+    2) "key991"
+    3) "key9990"
+    4) "key9907"
+    5) "key9918"
+    6) "key9964"
+    7) "key992"
+    8) "key9976"
+    9) "key9972"
+   10) "key9912"
+   11) "key9949"
+   12) "key9952"
+127.0.0.1:6379> scan 5401  match key99* count 1000
+1) "9421"
+2)  1) "key9941"
+    2) "key9917"
+    3) "key9977"
+    4) "key9902"
+    5) "key9969"
+    6) "key9953"
+    7) "key9909"
+    8) "key9992"
+    9) "key9962"
+   10) "key99"
+127.0.0.1:6379> scan 9421 match key99* count 1000
+1) "4403"
+2)  1) "key9926"
+    2) "key9970"
+    3) "key9948"
+    4) "key9966"
+    5) "key9974"
+    6) "key998"
+    7) "key9993"
+    8) "key9933"
+    9) "key9985"
+   10) "key9937"
+   11) "key9924"
+127.0.0.1:6379> scan 4403 match key99* count 1000
+1) "4519"
+2)  1) "key9908"
+    2) "key9946"
+    3) "key9960"
+    4) "key993"
+    5) "key9981"
+    6) "key9955"
+    7) "key9913"
+    8) "key9989"
+    9) "key9959"
+   10) "key9945"
+   11) "key9997"
+   12) "key9947"
+   13) "key9932"
+   14) "key9958"
+   15) "key9925"
+   16) "key9994"
+127.0.0.1:6379> scan 4519 match key99* count 1000
+1) "0"
+2)  1) "key9987"
+    2) "key9996"
+    3) "key9923"
+    4) "key9927"
+    5) "key990"
+    6) "key9928"
+    7) "key9942"
+    8) "key997"
+    9) "key9934"
+   10) "key9943"
+   11) "key999"
+
+```
+
+### 10.2 字典结构
+
+![image-20200714092259873](redisnote.assets/image-20200714092259873.png)
+
+redis中所有的key都存在一个大的字典中，这个字典是一维数组，是二维链表结构。数组大小为$2^n$ ,扩容一次，数组容量变大一倍。
+
+scan命令返回的游标是一维数组的位置索引，将其称为槽（slot）。
+
+imit参数表示遍历的槽位数，结果或多或少的原因是，每个槽挂载的链表元素数量不同，有空，有多。
+
+### 10.3 scan遍历顺序
+
+scan遍历顺序是高位进位加法，即从高位往低位加。
+
+二进制：00->10->01->11
+
+这样可以有效避免字典扩容或者缩容造成槽位重复遍历和遗漏。
+
+### 10.4 字典扩容
+
+rehash 对元素的hash值对数组元素进行取模运算，因为长度变了，每个元素挂载的槽位可能法发生变化。
+
+比如3（101）号扩容，扩容后的两个槽位是3（0101）和11（1101），原本挂载在3号的部分元素，rehash后会挂载到11号槽位
+
+### 10.4对比扩容、缩容前后的遍历顺序
+
+![image-20200714162738733](./redisnote.assets/image-20200714162738733.png)
+
+扩容：
+
+以110为例，扩容后，110上的槽位被分到0110和1110，后面可以从0110往后遍历，不会发生重复遍历的情况。
+
+缩容：
+
+以110为例，缩容后，110上的槽位元素被分到10槽位上，可以直接从10槽位往后遍历，但是10槽位包含了010槽位的元素，可能会造成和重复遍历。
+
+### 10.5渐进式rehash
+
+如果扩容时一次性将旧数据全部转移到新的数组下，可能造成线程卡顿。
+
+redis采用渐进rehash策略。
+
+同时保留旧数据和新数据，然后在定时任务中以及后续对hash的指令操作中渐渐地将旧数据挂接的数据迁移到新数据。
+
+若要对处于rehash扎状态的数组进行操作，要同时访问新旧两个数据，在旧数组找不到元素，就需要去新数组下面寻找。
+
+
+
+### 10.6更多的scan指令
+
+
+
+scan： 遍历所有的key
+
+zscan： 遍历zset集合元素
+
+hscan： 遍历hash字典的元素
+
+sscan： 遍历set集合的元素
+
+### 10.7大key扫描
+
+在业务开发中，要尽量避免大key的产生。
+
+redis-cl指令可扫描出大key：
+
+`redis-cli: -h 127.0.0.1 -p 7001 --bigkeys`
+
+或者增加睡眠参数，防止ops大幅抬升
+
+`redis-cli: -h 127.0.0.1 -p 7001 --bigkeys -i 0.1`
 
 
 
