@@ -598,7 +598,7 @@ redis管道由客户端提供
 
 
 
-#### 2.4.1 管道压力测试 
+### 2.4.1 管道压力测试 
 
 ```
 (base) digua@digua-virtual-machine:~$ redis-benchmark -t set  -q 
@@ -625,7 +625,7 @@ SET: 303030.28 requests per second
 
 
 
-#### 2.4.2 管道的本质
+### 2.4.2 管道的本质
 
 ![image-20200810151937905](redistheory.assets/image-20200810151937905.png)
 
@@ -821,3 +821,202 @@ client.setnx(key_for(user_id),5)
 print(double_account( client,user_id))
 ```
 
+## 2.6 PubSub
+
+### 2.6.1 消息多播
+
+消息多播允许生产者生产一次消息，中间件负责将消息复制到多个消息队列，每个消息 队列由相应的消费组进行消费。它是分布式系统常用的一种解耦方式，用于将多个消费组的 逻辑进行拆分。支持了消息多播，多个消费组的逻辑就可以放到不同的子系统中。
+
+![image-20200821153551924](redistheory.assets/image-20200821153551924.png)
+
+### 2.6.2 PubSub
+
+Redis 使用PubSub （publisherSubscriber）模块支持消息多播，发布者/订阅者模型
+
+
+
+#### 消费者 
+
+```python
+import redis 
+
+client=redis.StrictRedis()
+p=client.pubsub()
+p.subscribe("codehole")
+for msg in p.listen():
+    print(msg)
+```
+
+#### 生产者 
+
+```python
+import redis 
+
+client=redis.StrictRedis()
+client.publish("codehole", "java comes")
+client.publish("codehole", "python comes")
+client.publish("codehole", "golang comes")
+
+```
+
+先启动消费者，再启动生产者，可以启动多个生产者
+
+
+
+### 2.6.3 订阅模式 
+
+消费者订阅一个主题是必须明确指定主题的名 称。如果我们想要订阅多个主题，那就 subscribe 多个名称。
+
+```bash
+> subscribe codehole.image codehole.text codehole.blog # 同时订阅三个主题，会有三条订阅成功反
+馈信息
+1) "subscribe"
+2) "codehole.image"
+3) (integer) 1
+1) "subscribe"
+2) "codehole.text"
+3) (integer) 2
+1) "subscribe"
+2) "codehole.blog"
+3) (integer) 3
+
+```
+
+这样生产者向这三个主题发布的消息，这个消费者都可以接收到。
+
+```bash
+> publish codehole.image https://www.google.com/dudo.png
+(integer) 1
+> publish codehole.text " 你好，欢迎加入码洞 "
+(integer) 1
+> publish codehole.blog '{"content": "hello, everyone", "title": "welcome"}'
+(integer) 1
+```
+
+如果现在要增加一个主题 codehole.group，客户端必须也跟着增加一个订阅指令才可以收 到新开主题的消息推送。 为了简化订阅的繁琐，redis 提供了模式订阅功能 Pattern Subscribe，这样就可以一次订 阅多个主题，即使生产者新增加了同模式的主题，消费者也可以立即收到消息
+
+```bash
+> psubscribe codehole.* # 用模式匹配一次订阅多个主题，主题以 codehole. 字符开头的消息都可
+以收到
+1) "psubscribe"
+2) "codehole.*"
+3) (integer) 1
+```
+
+### 2.6.4 消息结构 
+
+```
+{'pattern': None, 'type': 'subscribe', 'channel': 'codehole', 'data': 1L}
+{'pattern': None, 'type': 'message', 'channel': 'codehole', 'data': 'python comes'}
+{'pattern': None, 'type': 'message', 'channel': 'codehole', 'data': 'java comes'}
+{'pattern': None, 'type': 'message', 'channel': 'codehole', 'data': 'golang comes'}
+```
+
+data 这个毫无疑问就是消息的内容，一个字符串。
+
+channel 表示当前订阅的主题名称。
+
+type 它表示消息的类型，如果是一个普通的消息，那么类型就是 message，如果是控制 消息，比如订阅指令的反馈，它的类型就是 subscribe，如果是模式订阅的反馈，它的类型就 是 psubscribe，还有取消订阅指令的反馈 unsubscribe 和 punsubscribe。 
+
+pattern 它表示当前消息是使用哪种模式订阅到的，如果是通过 subscribe 指令订阅的， 那么这个字段就是空。
+
+### 2.6.5 pubsub缺点 
+
+PubSub 的生产者传递过来一个消息，Redis 会直接找到相应的消费者传递过去。如果一 个消费者都没有，那么消息直接丢弃。如果开始有三个消费者，一个消费者突然挂掉了，生 产者会继续发送消息，另外两个消费者可以持续收到消息。但是挂掉的消费者重新连上的时 候，这断连期间生产者发送的消息，对于这个消费者来说就是彻底丢失了。
+
+ 如果 Redis 停机重启，PubSub 的消息是不会持久化的，毕竟 Redis 宕机就相当于一个 消费者都没有，所有的消息直接被丢弃。
+
+期 Redis5.0 新增了 Stream 数据结构，这个功能给 Redis 带来了持久化消息队列， 从此 PubSub 可以消失了
+
+
+
+## 2.7 小对象压缩 
+
+### 2.7.1 32bitvs64bit 
+
+Redis 如果使用 32bit 进行编译，内部所有数据结构所使用的指针空间占用会少一半， 如果你对 Redis 使用内存不超过 4G，可以考虑使用 32bit 进行编译，可以节约大量内存。 4G 的容量作为一些小型站点的缓存数据库是绰绰有余了，如果不足还可以通过增加实例的 方式来解决。
+
+### 2.7.2 小对象压缩存储  ziplist
+
+
+
+如果 Redis 内部管理的集合数据结构很小，它会使用紧凑存储形式压缩存储
+
+![image-20200824103737281](redistheory.assets/image-20200824103737281.png)
+
+如果它存储的是 hash 结构，那么 key 和 value 会作为两个 entry 相邻存在一起。
+
+```bash
+127.0.0.1:6379> hset hello a 1
+(integer) 1
+127.0.0.1:6379> hset hello b 2
+(integer) 1
+127.0.0.1:6379> hset hello c 3
+(integer) 1
+127.0.0.1:6379> object encoding hello
+"ziplist
+```
+
+如果它存储的是 zset，那么 value 和 score 会作为两个 entry 相邻存在一起。
+
+```bash
+127.0.0.1:6379> zadd world 1 a
+(integer) 1
+127.0.0.1:6379> zadd world 2 b
+(integer) 1
+127.0.0.1:6379> zadd world 3 c
+(integer) 1
+127.0.0.1:6379> object encoding world
+"ziplist"
+```
+
+Redis 的 intset 是一个紧凑的整数数组结构，它用于存放元素都是整数的并且元素个数 较少的 set 集合。 如果整数可以用 uint16 表示，那么 intset 的元素就是 16 位的数组，如果新加入的整 数超过了 uint16 的表示范围，那么就使用 uint32 表示，如果新加入的元素超过了 uint32 的表示范围，那么就使用 uint64 表示，Redis 支持 set 集合动态从 uint16 升级到 uint32， 再升级到 uint64。
+
+![image-20200824163642734](redistheory.assets/image-20200824163642734.png)
+
+```
+127.0.0.1:6379> sadd hello 1 2 3
+(integer) 3
+127.0.0.1:6379> object encoding hello
+"intset"
+```
+
+如果 set 里存储的是字符串，那么 sadd 立即升级为 hashtable 结构。
+
+```bash
+127.0.0.1:6379> sadd hello yes no
+(integer) 2
+127.0.0.1:6379> object encoding hello
+"hashtable"
+
+```
+
+存储界限 当集合对象的元素不断增加，或者某个 value 值过大，这种小对象存储也会 被升级为标准结构。
+
+```bash
+Redis 规定在小对象存储结构的限制条件如下：
+hash-max-zipmap-entries 512 # hash 的元素个数超过 512 就必须用标准结构存储
+hash-max-zipmap-value 64 # hash 的任意元素的 key/value 的长度超过 64 就必须用标准结构存储
+list-max-ziplist-entries 512 # list 的元素个数超过 512 就必须用标准结构存储
+list-max-ziplist-value 64 # list 的任意元素的长度超过 64 就必须用标准结构存储
+zset-max-ziplist-entries 128 # zset 的元素个数超过 128 就必须用标准结构存储
+zset-max-ziplist-value 64 # zset 的任意元素的长度超过 64 就必须用标准结构存储
+set-max-intset-entries 512 # set 的整数元素个数超过 512 就必须用标准结构存储
+
+```
+
+
+
+### 2.7.3 内存回收机制
+
+Redis 并不总是可以将空闲内存立即归还给操作系统。
+
+如果当前 Redis 内存有 10G，当你删除了 1GB 的 key 后，再去观察内存，你会发现 内存变化不会太大。原因是操作系统回收内存是以页为单位，如果这个页上只要有一个 key 还在使用，那么它就不能被回收。Redis 虽然删除了 1GB 的 key，但是这些 key 分散到了 很多页面中，每个页面都还有其它 key 存在，这就导致了内存不会立即被回收。 
+
+如果你执行 flushdb，然后再观察内存会发现内存确实被回收了。原因是所有的 key 都干掉了，大部分之前使用的页面都完全干净了，会立即被操作系统回收。 Redis 虽然无法保证立即回收已经删除的 key 的内存，但是它会重用那些尚未回收的空闲内存。
+
+这就好比电影院里虽然人走了，但是座位还在，下一波观众来了，直接坐就行。而 操作系统回收内存就好比把座位都给搬走了。
+
+### 2.7.4 内存分配算法 
+
+Redis 为了保持自身结构的简单性，在内存分配这里直接做了甩手掌柜，将内存分配的 细节丢给了第三方内存分配库去实现。目前 Redis 可以使用 jemalloc(facebook) 库来管理内 存，也可以切换到 tcmalloc(google)。因为 jemalloc 相比 tcmalloc 的性能要稍好一些，所以 Redis 默认使用了 jemallo
